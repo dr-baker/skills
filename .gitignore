@@ -1,0 +1,17 @@
+# Keep publication explicit. Other skills and local metadata stay on this machine.
+/*
+!/.gitignore
+!/README.md
+!/skills/
+/skills/*
+!/skills/agents-md-charter/
+!/skills/commit-style/
+!/skills/cow-worktree/
+!/skills/git-style/
+!/skills/interaction-design-v2/
+!/skills/merge-commit-style/
+!/skills/sql-style/
+
+.DS_Store
+__pycache__/
+*.py[cod]

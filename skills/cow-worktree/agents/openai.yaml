@@ -1,0 +1,7 @@
+interface:
+  display_name: "COW Worktree"
+  short_description: "Start work in an APFS COW worktree"
+  default_prompt: "Use $cow-worktree to start this implementation in an isolated copy-on-write worktree."
+
+policy:
+  allow_implicit_invocation: true

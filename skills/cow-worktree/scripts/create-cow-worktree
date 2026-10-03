@@ -1,0 +1,405 @@
+#!/usr/bin/env python3
+import argparse
+import os
+import shutil
+import subprocess
+import sys
+import tempfile
+from pathlib import Path
+
+
+def run(args, cwd=None, check=True, text=True):
+    result = subprocess.run(args, cwd=cwd, text=text, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    if check and result.returncode != 0:
+        detail = (result.stderr or result.stdout or "").strip()
+        raise RuntimeError(f"{' '.join(args)} failed{': ' + detail if detail else ''}")
+    return result
+
+
+def git(cwd, args, check=True):
+    return run(["git", *args], cwd=cwd, check=check)
+
+
+def git_out(cwd, args):
+    return git(cwd, args).stdout.strip()
+
+
+def contained_relative(path):
+    p = Path(path)
+    return (
+        bool(path)
+        and path != "."
+        and not p.is_absolute()
+        and ".." not in p.parts
+        and "\n" not in path
+        and "\r" not in path
+    )
+
+
+def parse_ls_files_stage(raw):
+    entries = []
+    for record in raw.split("\0"):
+        if not record:
+            continue
+        meta, sep, file_path = record.partition("\t")
+        if not sep:
+            raise RuntimeError(f"Could not parse git ls-files entry: {record}")
+        if not contained_relative(file_path):
+            raise RuntimeError(f"Refusing unsafe Git path: {file_path}")
+        mode = meta.split(" ", 1)[0]
+        entries.append((mode, file_path))
+    return entries
+
+
+def parse_ls_tree_submodules(raw):
+    """Return direct submodule (path, pinned commit) entries from a tree."""
+    entries = []
+    for record in raw.split("\0"):
+        if not record:
+            continue
+        meta, sep, file_path = record.partition("\t")
+        if not sep:
+            raise RuntimeError(f"Could not parse git ls-tree entry: {record}")
+        parts = meta.split(" ")
+        if len(parts) != 3:
+            raise RuntimeError(f"Could not parse git ls-tree metadata: {meta}")
+        mode, object_type, object_id = parts
+        if mode != "160000":
+            continue
+        if object_type != "commit" or len(object_id) != 40 or any(c not in "0123456789abcdef" for c in object_id):
+            raise RuntimeError(f"Invalid Git submodule entry at {file_path}")
+        if not contained_relative(file_path):
+            raise RuntimeError(f"Refusing unsafe Git submodule path: {file_path}")
+        entries.append((file_path, object_id))
+    return entries
+
+
+def grouped_by_dir(entries):
+    groups = {}
+    for mode, rel in entries:
+        groups.setdefault(str(Path(rel).parent), []).append((mode, rel))
+    return groups
+
+
+def chunks(paths, max_chars=100_000):
+    current = []
+    current_chars = 0
+    for path in paths:
+        next_chars = current_chars + len(path) + 1
+        if current and next_chars > max_chars:
+            yield current
+            current = []
+            current_chars = 0
+        current.append(path)
+        current_chars += len(path) + 1
+    if current:
+        yield current
+
+
+def ensure_cp_c_supported():
+    if sys.platform != "darwin":
+        raise RuntimeError("copy-on-write worktrees require macOS/APFS cp -c")
+    with tempfile.TemporaryDirectory(prefix="cow-worktree-probe-") as tmp:
+        src = Path(tmp) / "src"
+        dst = Path(tmp) / "dst"
+        src.write_text("probe\n")
+        result = run(["cp", "-c", str(src), str(dst)], check=False)
+        if result.returncode != 0:
+            detail = (result.stderr or result.stdout or "").strip()
+            raise RuntimeError(f"cp -c is unavailable{': ' + detail if detail else ''}")
+
+
+def source_has_dirty_changes(repo_root):
+    git(repo_root, ["update-index", "-q", "--refresh"], check=False)
+    status = git(repo_root, ["status", "--porcelain=v1", "--untracked-files=all"]).stdout.strip()
+    tracked_dirty = git(repo_root, ["diff-index", "--name-only", "-z", "HEAD", "--"]).stdout
+    return status, [p for p in tracked_dirty.split("\0") if p]
+
+
+def create_git_worktree(repo_root, branch, base, worktree, no_checkout):
+    args = ["worktree", "add"]
+    if no_checkout:
+        args.append("--no-checkout")
+    args.extend([str(worktree), "-b", branch, base])
+    git(repo_root, args)
+
+
+def remove_worktree(repo_root, path):
+    git(repo_root, ["worktree", "remove", "--force", str(path)], check=False)
+    shutil.rmtree(path, ignore_errors=True)
+    git(repo_root, ["worktree", "prune"], check=False)
+
+
+def create_clean_source_worktree(repo_root, base):
+    temp_parent = Path(tempfile.mkdtemp(prefix="cow-worktree-source-parent-"))
+    source = temp_parent / "source"
+    try:
+        git(repo_root, ["worktree", "add", "--detach", str(source), base])
+        return temp_parent, source
+    except Exception:
+        shutil.rmtree(temp_parent, ignore_errors=True)
+        raise
+
+
+def git_dir(git_dir_path, args, check=True):
+    return run(["git", f"--git-dir={git_dir_path}", *args], check=check)
+
+
+def git_dir_out(git_dir_path, args):
+    return git_dir(git_dir_path, args).stdout.strip()
+
+
+def resolve_git_path(owner_git_dir, raw_path):
+    path = Path(raw_path)
+    if not path.is_absolute():
+        path = Path(owner_git_dir) / path
+    return path.resolve()
+
+
+def module_git_dir(parent_git_dir, child_path):
+    raw_path = git_dir_out(parent_git_dir, ["rev-parse", "--git-path", f"modules/{child_path}"])
+    module_dir = resolve_git_path(parent_git_dir, raw_path)
+    if not module_dir.is_dir() or not (module_dir / "HEAD").exists():
+        raise RuntimeError(
+            f"Submodule metadata is unavailable for {child_path}; initialize the pinned submodule locally before creating a COW worktree"
+        )
+    return module_dir
+
+
+def assert_submodule_declared(parent_checkout, child_path):
+    result = git(
+        parent_checkout,
+        ["config", "--file", ".gitmodules", "--get-regexp", r"^submodule\..*\.path$"],
+        check=False,
+    )
+    if result.returncode != 0:
+        raise RuntimeError(f"Submodule metadata is missing for {child_path}: .gitmodules has no declared paths")
+    declared = set()
+    for line in result.stdout.splitlines():
+        _, separator, value = line.partition("\t")
+        if not separator:
+            _, separator, value = line.partition(" ")
+        if separator:
+            declared.add(value)
+    if child_path not in declared:
+        raise RuntimeError(f"Submodule metadata does not declare path {child_path}")
+
+
+def git_dir_has_commit(git_dir_path, commit):
+    return git_dir(git_dir_path, ["cat-file", "-e", f"{commit}^{{commit}}"], check=False).returncode == 0
+
+
+def clean_checkout_at(path, commit):
+    if not path.is_dir():
+        return False
+    try:
+        if Path(git_out(path, ["rev-parse", "--show-toplevel"])).resolve() != path.resolve():
+            return False
+        if git_out(path, ["rev-parse", "--verify", "HEAD"]) != commit:
+            return False
+        return not git(path, ["status", "--porcelain=v1", "--untracked-files=no"]).stdout.strip()
+    except RuntimeError:
+        return False
+
+
+def add_submodule_worktree(module_dir, destination, commit, no_checkout):
+    args = ["worktree", "add", "--detach"]
+    if no_checkout:
+        args.append("--no-checkout")
+    args.extend([str(destination), commit])
+    git_dir(module_dir, args)
+
+
+def remove_submodule_worktree(module_dir, destination):
+    git_dir(module_dir, ["worktree", "remove", "--force", str(destination)], check=False)
+    shutil.rmtree(destination, ignore_errors=True)
+    git_dir(module_dir, ["worktree", "prune"], check=False)
+
+
+def cleanup_submodule_worktrees(worktrees):
+    for module_dir, destination in reversed(worktrees):
+        remove_submodule_worktree(module_dir, destination)
+
+
+def populate_submodules(repo_root, root_git_dir, base, source_root, target_root):
+    """Create independent submodule worktrees, then COW-clone their tracked files.
+
+    The existing module repositories supply local object databases. We deliberately
+    do not fetch or clone here: a missing pinned commit is a reproducibility error.
+    """
+    source_created = []
+    target_created = []
+
+    def recurse(parent_git_dir, parent_commit, parent_source, parent_target, prefix):
+        tree = git_dir(parent_git_dir, ["ls-tree", "-z", parent_commit]).stdout
+        for child_name, child_commit in parse_ls_tree_submodules(tree):
+            assert_submodule_declared(parent_source, child_name)
+            child_relative = str(Path(prefix) / child_name) if prefix else child_name
+            child_module_dir = module_git_dir(parent_git_dir, child_name)
+            if not git_dir_has_commit(child_module_dir, child_commit):
+                raise RuntimeError(
+                    f"Pinned submodule commit is unavailable locally for {child_relative}: {child_commit}"
+                )
+
+            canonical_source = Path(repo_root) / child_relative
+            if clean_checkout_at(canonical_source, child_commit):
+                child_source = canonical_source
+            else:
+                child_source = Path(source_root) / child_relative
+                child_source.parent.mkdir(parents=True, exist_ok=True)
+                add_submodule_worktree(child_module_dir, child_source, child_commit, no_checkout=False)
+                source_created.append((child_module_dir, child_source))
+
+            child_target = Path(target_root) / child_relative
+            child_target.parent.mkdir(parents=True, exist_ok=True)
+            add_submodule_worktree(child_module_dir, child_target, child_commit, no_checkout=True)
+            target_created.append((child_module_dir, child_target))
+            git(child_target, ["read-tree", "HEAD"])
+            child_entries = parse_ls_files_stage(git(child_target, ["ls-files", "-z", "--stage"]).stdout)
+            copy_with_cow(child_source, child_target, child_entries)
+
+            recurse(child_module_dir, child_commit, child_source, child_target, child_relative)
+
+            git(child_target, ["update-index", "--refresh"])
+            child_status = git(child_target, ["status", "--porcelain=v1"]).stdout.strip()
+            if child_status:
+                raise RuntimeError(f"COW submodule worktree was not clean after checkout at {child_relative}:\n{child_status}")
+
+    try:
+        recurse(root_git_dir, base, Path(source_root), Path(target_root), "")
+        return source_created, target_created
+    except Exception:
+        cleanup_submodule_worktrees(target_created)
+        cleanup_submodule_worktrees(source_created)
+        raise
+
+
+def copy_with_cow(source_root, target_root, entries):
+    regular = []
+    symlinks = []
+    for mode, rel in entries:
+        if mode in ("100644", "100755"):
+            if not (source_root / rel).is_file():
+                raise RuntimeError(f"Source file is not regular: {rel}")
+            regular.append((mode, rel))
+        elif mode == "120000":
+            if not (source_root / rel).is_symlink():
+                raise RuntimeError(f"Source path is not a symlink: {rel}")
+            symlinks.append((mode, rel))
+        elif mode == "160000":
+            # Gitlinks have no regular file content. populate_submodules creates
+            # their own worktrees and clones their tracked files separately.
+            continue
+        else:
+            raise RuntimeError(f"Unsupported Git entry mode {mode} at {rel}")
+
+    for rel_dir, dir_entries in grouped_by_dir(regular).items():
+        source_dir = source_root if rel_dir == "." else source_root / rel_dir
+        target_dir = target_root if rel_dir == "." else target_root / rel_dir
+        target_dir.mkdir(parents=True, exist_ok=True)
+        sources = [str(source_dir / Path(rel).name) for _, rel in dir_entries]
+        for chunk in chunks(sources):
+            result = run(["cp", "-c", "-p", *chunk, str(target_dir)], cwd=str(source_root), check=False)
+            if result.returncode != 0:
+                detail = (result.stderr or result.stdout or "cp -c failed").strip()
+                raise RuntimeError(detail)
+
+    for mode, rel in regular:
+        os.chmod(target_root / rel, 0o755 if mode == "100755" else 0o644)
+
+    for _, rel in symlinks:
+        target = target_root / rel
+        target.parent.mkdir(parents=True, exist_ok=True)
+        os.symlink(os.readlink(source_root / rel), target)
+
+
+def create_cow_worktree(repo_root, branch, base, worktree, clone_mode, tracked_dirty):
+    if clone_mode == "never":
+        create_git_worktree(repo_root, branch, base, worktree, no_checkout=False)
+        return "normal"
+
+    ensure_cp_c_supported()
+    source_head = git_out(repo_root, ["rev-parse", "--verify", "HEAD"])
+    base_commit = git_out(repo_root, ["rev-parse", "--verify", f"{base}^{{commit}}"])
+    root_git_dir = resolve_git_path(repo_root, git_out(repo_root, ["rev-parse", "--git-dir"]))
+    root_tree = git_dir(root_git_dir, ["ls-tree", "-z", base_commit]).stdout
+    has_submodules = bool(parse_ls_tree_submodules(root_tree))
+    use_source_checkout = source_head == base_commit and not tracked_dirty and not has_submodules
+
+    temp_parent = None
+    source_root = Path(repo_root)
+    if not use_source_checkout:
+        temp_parent, source_root = create_clean_source_worktree(repo_root, base)
+
+    created = False
+    source_submodules = []
+    target_submodules = []
+    try:
+        create_git_worktree(repo_root, branch, base, worktree, no_checkout=True)
+        created = True
+        git(worktree, ["read-tree", "HEAD"])
+        ls_files = git(worktree, ["ls-files", "-z", "--stage"]).stdout
+        copy_with_cow(source_root, worktree, parse_ls_files_stage(ls_files))
+        if has_submodules:
+            source_submodules, target_submodules = populate_submodules(
+                repo_root, root_git_dir, base_commit, source_root, worktree
+            )
+        git(worktree, ["update-index", "--refresh"])
+        status = git(worktree, ["status", "--porcelain=v1"]).stdout.strip()
+        if status:
+            raise RuntimeError(f"COW worktree was not clean after checkout:\n{status}")
+        return "cow"
+    except Exception:
+        cleanup_submodule_worktrees(target_submodules)
+        if created:
+            remove_worktree(repo_root, worktree)
+            git(repo_root, ["branch", "-D", branch], check=False)
+        if clone_mode == "auto":
+            create_git_worktree(repo_root, branch, base, worktree, no_checkout=False)
+            return "normal"
+        raise
+    finally:
+        cleanup_submodule_worktrees(source_submodules)
+        if temp_parent:
+            remove_worktree(repo_root, source_root)
+            shutil.rmtree(temp_parent, ignore_errors=True)
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Create a Git worktree populated with APFS copy-on-write file clones.")
+    parser.add_argument("--repo", default=".", help="Source repository path. Defaults to cwd.")
+    parser.add_argument("--branch", required=True, help="Branch to create for the worktree.")
+    parser.add_argument("--worktree", required=True, help="Worktree path. Relative paths resolve from the repo root.")
+    parser.add_argument("--base", default="HEAD", help="Base commit/ref. Defaults to HEAD.")
+    parser.add_argument("--dirty-policy", choices=["head", "stop"], default="head", help="Default: head.")
+    parser.add_argument("--clone-mode", choices=["require", "auto", "never"], default="require", help="Default: require.")
+    args = parser.parse_args()
+
+    repo_root = Path(git_out(args.repo, ["rev-parse", "--show-toplevel"])).resolve()
+    worktree = Path(args.worktree)
+    if not worktree.is_absolute():
+        worktree = repo_root / worktree
+    worktree = worktree.resolve()
+    if worktree.exists():
+        raise RuntimeError(f"Worktree path already exists: {worktree}")
+    worktree.parent.mkdir(parents=True, exist_ok=True)
+
+    status, tracked_dirty = source_has_dirty_changes(str(repo_root))
+    if status and args.dirty_policy == "stop":
+        raise RuntimeError(f"Source checkout is dirty:\n{status}")
+
+    mode = create_cow_worktree(str(repo_root), args.branch, args.base, worktree, args.clone_mode, tracked_dirty)
+    if status and args.dirty_policy == "head":
+        print("Source checkout has uncommitted changes; the worktree starts from HEAD and ignores them.")
+    print(f"worktree={worktree}")
+    print(f"branch={args.branch}")
+    print(f"base={args.base}")
+    print(f"mode={mode}")
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except Exception as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        sys.exit(1)
