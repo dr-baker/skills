@@ -1,6 +1,6 @@
 # Skills
 
-My personal skills for interface design, SQL, and Git workflows.
+My personal skills for interface design, SQL, Git workflows, and skill maintenance.
 
 - [Interaction design](skills/interaction-design-v2/SKILL.md) guides custom interactions, visual hierarchy, progressive disclosure, and reviews through the audience's eyes.
 - [SQL style](skills/sql-style/SKILL.md) defines compact analytical SQL, with separate rules for short queries and production reporting.
@@ -11,6 +11,8 @@ My personal skills for interface design, SQL, and Git workflows.
 - [COW worktree](skills/cow-worktree/SKILL.md) creates isolated Git worktrees using APFS copy-on-write file clones, including pinned submodules. It requires macOS.
 
 ## Keep one source folder
+
+[House Skills](skills/house-skills/SKILL.md) covers the canonical folder, symlink rules, and how to add, edit, publish, or retire a skill.
 
 For a fresh installation, clone the repository into `~/.agents`:
 
